@@ -12,11 +12,11 @@ env:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Maximize disk space (rm -rf only, no apt-get purge)
+      - name: Maximize disk space
         run: |
           echo "=== BEFORE ==="
           df -h /
@@ -39,13 +39,18 @@ jobs:
           echo "=== AFTER ==="
           df -h /
 
+      - name: Install rapidgzip
+        run: |
+          python3 -m pip install --user --break-system-packages rapidgzip
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Create release for parts
         run: |
           gh release delete "db-dump-${{ github.run_id }}" --yes 2>/dev/null || true
           gh release create "db-dump-${{ github.run_id }}" --target main \
             --title "DB Parts" --notes "Temporary parts for decompression"
 
-      - name: Download, decompress to parts, upload as they complete
+      - name: Download, decompress (rapidgzip), split, upload in parallel
         run: |
           set -e
           RELEASE_TAG="db-dump-${{ github.run_id }}"
@@ -57,29 +62,31 @@ jobs:
           ls -lh lrclib.sqlite3.gz
           df -h /
 
-          echo "=== DECOMPRESS + SPLIT + UPLOAD ==="
-          pigz -dc lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.sqlite3.part- &
-          PIPE_PID=$!
-          # pigz runs as parent of split in the pipeline; find pigz PID
-          PIGZ_PID=$(pgrep -f "pigz -dc" | head -1)
-          SPLIT_PID=$(pgrep -f "split -b 1900M" | head -1)
-          echo "pigz PID: $PIGZ_PID, split PID: $SPLIT_PID"
+          echo "=== DECOMPRESS (rapidgzip) + SPLIT + UPLOAD ==="
+          # 3 parallel processes:
+          # 1. rapidgzip: true parallel gzip decompression (not single-threaded like pigz)
+          # 2. punch-hole on gzip file as rapidgzip reads it
+          # 3. upload completed parts to GitHub Release, then delete locally
+          rapidgzip -d -c -P 0 lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.part- &
+          SPLIT_PID=$!
+          RAPIDGZIP_PID=$(pgrep -P "$SPLIT_PID" rapidgzip || pgrep -x rapidgzip | head -1)
+          echo "rapidgzip PID: $RAPIDGZIP_PID, split PID: $SPLIT_PID"
 
           uploaded=0
           SAFETY_MARGIN=$((50 * 1024 * 1024))
 
           while kill -0 "$SPLIT_PID" 2>/dev/null; do
-            sleep 10
+            sleep 5
 
-            # Punch-hole on gzip file to reclaim read portions
+            # Process 2: punch-hole on gzip file
             pos=0
-            if [ -n "$PIGZ_PID" ] && [ -d "/proc/$PIGZ_PID" ]; then
-              for fd in /proc/$PIGZ_PID/fd/*; do
+            if [ -n "$RAPIDGZIP_PID" ] && [ -d "/proc/$RAPIDGZIP_PID" ]; then
+              for fd in /proc/$RAPIDGZIP_PID/fd/*; do
                 target=$(readlink "$fd" 2>/dev/null || true)
                 case "$target" in
                   *lrclib.sqlite3.gz)
                     fd_num=$(basename "$fd")
-                    pos=$(cat "/proc/$PIGZ_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
+                    pos=$(cat "/proc/$RAPIDGZIP_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
                     ;;
                 esac
               done
@@ -89,7 +96,8 @@ jobs:
               fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
             fi
 
-            for part in lrclib.sqlite3.part-*; do
+            # Process 3: upload completed parts
+            for part in lrclib.part-*; do
               [ -f "$part" ] || continue
               size=$(stat -c %s "$part" 2>/dev/null || echo 0)
               if [ "$size" -ge "$PART_SIZE" ]; then
@@ -117,7 +125,7 @@ jobs:
           wait "$SPLIT_PID"
           echo "Decompression complete"
 
-          for part in lrclib.sqlite3.part-*; do
+          for part in lrclib.part-*; do
             [ -f "$part" ] || continue
             echo "Uploading final part $part..."
             sha256sum "$part" > "${part}.sha256"
@@ -167,7 +175,7 @@ jobs:
           stat -c %s lrclib.sqlite3
           df -h /
 
-      - name: Verify SQLite integrity
+      - name: Verify integrity
         run: |
           echo "=== INTEGRITY CHECK ==="
           sqlite3 lrclib.sqlite3 "PRAGMA integrity_check;"
