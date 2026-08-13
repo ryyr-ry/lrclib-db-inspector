@@ -53,91 +53,95 @@ jobs:
           df -h /
 
       - name: Mount gzip via ratarmount
+        env:
+          MOUNT_DIR: ${{ github.workspace }}/mnt/sqlite
         run: |
           echo "=== MOUNTING ==="
-          mkdir -p $HOME$HOME/mnt/sqlite
+          mkdir -p "$MOUNT_DIR"
+          ulimit -s unlimited 2>/dev/null || true
+          ulimit -n 65536 2>/dev/null || true
           START=$(date +%s)
-          ratarmount -P 0 lrclib.sqlite3.gz $HOME$HOME/mnt/sqlite 2>&1
+          ratarmount -P 0 --no-mmap lrclib.sqlite3.gz "$MOUNT_DIR" 2>&1
           END=$(date +%s)
           echo "Mount time: $((END - START))s"
           echo "=== MOUNTED ==="
-          ls -la $HOME$HOME/mnt/sqlite/
+          ls -la "$MOUNT_DIR"/
           df -h /
 
       - name: Verify SQLite access via FUSE
         run: |
           echo "=== SQLITE ACCESS TEST ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "PRAGMA integrity_check;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "PRAGMA integrity_check;"
           echo "=== TABLES ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 ".tables"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 ".tables"
 
       - name: Inspect schema
         run: |
           echo "=== TRACKS SCHEMA ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 ".schema tracks"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 ".schema tracks"
           echo ""
           echo "=== LYRICS SCHEMA ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 ".schema lyrics"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 ".schema lyrics"
           echo ""
           echo "=== ALL INDEXES ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 ".indexes"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 ".indexes"
           echo ""
           echo "=== ALL TRIGGERS ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 ".trigger"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 ".trigger"
 
       - name: Count records
         run: |
           echo "=== TRACK COUNT ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks;"
           echo ""
           echo "=== LYRICS COUNT ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics;"
           echo ""
           echo "=== LYRICS WITH LYRICSFILE ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 1;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 1;"
           echo ""
           echo "=== LYRICS WITHOUT LYRICSFILE ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
           echo ""
           echo "=== LYRICS WITH PLAIN LYRICS ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
           echo ""
           echo "=== LYRICS WITH SYNCED LYRICS ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
           echo ""
           echo "=== TRACKS WITH LAST_LYRICS_ID ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
           echo ""
           echo "=== TRACKS WITHOUT LAST_LYRICS_ID ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
           echo ""
           echo "=== INSTRUMENTAL TRACKS ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
 
       - name: Measure field sizes
         run: |
           echo "=== AVG PLAIN_LYRICS LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(plain_lyrics)) FROM lyrics WHERE plain_lyrics IS NOT NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(plain_lyrics)) FROM lyrics WHERE plain_lyrics IS NOT NULL;"
           echo ""
           echo "=== AVG SYNCED_LYRICS LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(synced_lyrics)) FROM lyrics WHERE synced_lyrics IS NOT NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(synced_lyrics)) FROM lyrics WHERE synced_lyrics IS NOT NULL;"
           echo ""
           echo "=== AVG LYRICSFILE LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(lyricsfile)) FROM lyrics WHERE lyricsfile IS NOT NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(lyricsfile)) FROM lyrics WHERE lyricsfile IS NOT NULL;"
           echo ""
           echo "=== MAX PLAIN_LYRICS LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(plain_lyrics)) FROM lyrics;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(plain_lyrics)) FROM lyrics;"
           echo ""
           echo "=== MAX SYNCED_LYRICS LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(synced_lyrics)) FROM lyrics;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(synced_lyrics)) FROM lyrics;"
           echo ""
           echo "=== MAX LYRICSFILE LENGTH ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(lyricsfile)) FROM lyrics;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(lyricsfile)) FROM lyrics;"
 
       - name: Estimate JSON export size
         run: |
           echo "=== TOTAL API FIELD BYTES (joined tracks + lyrics) ==="
-          TOTAL_BYTES=$(sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT SUM(
+          TOTAL_BYTES=$(sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT SUM(
             COALESCE(LENGTH(t.name),0) +
             COALESCE(LENGTH(t.name),0) +
             COALESCE(LENGTH(t.artist_name),0) +
@@ -160,24 +164,24 @@ jobs:
       - name: Sample joined records
         run: |
           echo "=== SAMPLE RECORDS ==="
-          sqlite3 -json $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
+          sqlite3 -json ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
           echo ""
           echo "=== SAMPLE LYRICSFILE (first 500 chars) ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
 
       - name: Check for edge cases
         run: |
           echo "=== TRACKS WITH NULL name ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
           echo ""
           echo "=== TRACKS WITH NULL artist_name ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
           echo ""
           echo "=== TRACKS WITH NULL duration ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
           echo ""
           echo "=== DURATION RANGE ==="
-          sqlite3 $HOME/mnt/sqlite/lrclib.sqlite3 "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
+          sqlite3 ${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3 "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
 
       - name: Final disk space
         run: df -h /
@@ -185,7 +189,7 @@ jobs:
       - name: Unmount and cleanup
         if: always()
         run: |
-          fusermount -u $HOME/mnt/sqlite 2>/dev/null || true
+          fusermount -u ${{ github.workspace }}/mnt/sqlite 2>/dev/null || true
           rm -f lrclib.sqlite3.gz
           rm -f .*.index.sqlite
           df -h /
