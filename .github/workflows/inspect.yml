@@ -61,7 +61,7 @@ jobs:
           ulimit -s unlimited 2>/dev/null || true
           ulimit -n 65536 2>/dev/null || true
           START=$(date +%s)
-          ratarmount -P 0 --no-mmap lrclib.sqlite3.gz "$MOUNT_DIR" 2>&1
+          ratarmount -P 0 -gs 4194304 lrclib.sqlite3.gz "$MOUNT_DIR" 2>&1
           END=$(date +%s)
           echo "Mount time: $((END - START))s"
           echo "=== MOUNTED ==="
