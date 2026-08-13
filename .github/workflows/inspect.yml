@@ -57,13 +57,10 @@ jobs:
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install aria2 (static binary via curl)
+      - name: Install aria2
         run: |
-          curl -sL -o /tmp/aria2c.tar.gz https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-x86_64-linux-gnu-1.tar.gz
-          tar xzf /tmp/aria2c.tar.gz -C /tmp
-          cp /tmp/aria2-1.37.0-x86_64-linux-gnu-1/bin/aria2c ./aria2c
-          chmod +x ./aria2c
-          rm -rf /tmp/aria2c.tar.gz /tmp/aria2-1.37.0-x86_64-linux-gnu-1
+          sudo apt-get update
+          sudo apt-get install -y aria2
 
       - name: Disk space before download
         run: df -h /
