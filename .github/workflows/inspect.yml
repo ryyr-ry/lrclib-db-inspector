@@ -57,17 +57,12 @@ jobs:
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install aria2
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
-
       - name: Disk space before download
         run: df -h /
 
       - name: Download LRCLIB database dump
         run: |
-          ./aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
+          aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
 
       - name: Compressed file size and disk after download
