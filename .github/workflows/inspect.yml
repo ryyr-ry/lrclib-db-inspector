@@ -68,134 +68,17 @@ jobs:
           ls -la "$MOUNT_DIR"/
           df -h /
 
-      - name: Verify SQLite access via FUSE
+      - name: Inspect DB (single Python script, one connection)
         env:
           DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
         run: |
-          echo "=== SQLITE ACCESS TEST ==="
-          sqlite3 "$DB_URI" "PRAGMA integrity_check;"
-          echo "=== TABLES ==="
-          sqlite3 "$DB_URI" ".tables"
+          python3 scripts/inspect_db.py "$DB_URI"
 
-      - name: Inspect schema
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== TRACKS SCHEMA ==="
-          sqlite3 "$DB_URI" ".schema tracks"
-          echo ""
-          echo "=== LYRICS SCHEMA ==="
-          sqlite3 "$DB_URI" ".schema lyrics"
-          echo ""
-          echo "=== ALL INDEXES ==="
-          sqlite3 "$DB_URI" ".indexes"
-          echo ""
-          echo "=== ALL TRIGGERS ==="
-          sqlite3 "$DB_URI" ".trigger"
-
-      - name: Count records
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== TRACK COUNT ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks;"
-          echo ""
-          echo "=== LYRICS COUNT ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics;"
-          echo ""
-          echo "=== LYRICS WITH LYRICSFILE ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 1;"
-          echo ""
-          echo "=== LYRICS WITHOUT LYRICSFILE ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
-          echo ""
-          echo "=== LYRICS WITH PLAIN LYRICS ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
-          echo ""
-          echo "=== LYRICS WITH SYNCED LYRICS ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
-          echo ""
-          echo "=== TRACKS WITH LAST_LYRICS_ID ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
-          echo ""
-          echo "=== TRACKS WITHOUT LAST_LYRICS_ID ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
-          echo ""
-          echo "=== INSTRUMENTAL TRACKS ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
-
-      - name: Measure field sizes
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== AVG PLAIN_LYRICS LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT AVG(LENGTH(plain_lyrics)) FROM lyrics WHERE plain_lyrics IS NOT NULL;"
-          echo ""
-          echo "=== AVG SYNCED_LYRICS LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT AVG(LENGTH(synced_lyrics)) FROM lyrics WHERE synced_lyrics IS NOT NULL;"
-          echo ""
-          echo "=== AVG LYRICSFILE LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT AVG(LENGTH(lyricsfile)) FROM lyrics WHERE lyricsfile IS NOT NULL;"
-          echo ""
-          echo "=== MAX PLAIN_LYRICS LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT MAX(LENGTH(plain_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== MAX SYNCED_LYRICS LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT MAX(LENGTH(synced_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== MAX LYRICSFILE LENGTH ==="
-          sqlite3 "$DB_URI" "SELECT MAX(LENGTH(lyricsfile)) FROM lyrics;"
-
-      - name: Estimate JSON export size
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== TOTAL API FIELD BYTES (joined tracks + lyrics) ==="
-          TOTAL_BYTES=$(sqlite3 "$DB_URI" "SELECT SUM(
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.artist_name),0) +
-            COALESCE(LENGTH(t.album_name),0) +
-            8 +
-            1 +
-            COALESCE(LENGTH(l.plain_lyrics),0) +
-            COALESCE(LENGTH(l.synced_lyrics),0) +
-            COALESCE(LENGTH(l.lyricsfile),0)
-          )
-          FROM tracks t
-          LEFT JOIN lyrics l ON t.last_lyrics_id = l.id;")
-          echo "Total API field bytes (raw): $TOTAL_BYTES"
-          JSON_ESTIMATE=$(python3 -c "print(int($TOTAL_BYTES * 1.4))")
-          echo "Estimated JSON size (with overhead): $JSON_ESTIMATE bytes"
-          echo "Estimated JSON size (GB): $(python3 -c "print(f'{$JSON_ESTIMATE / 1073741824:.2f}')") GB"
-          echo "Estimated rooms at 72 MiB each: $(python3 -c "print($JSON_ESTIMATE // 75497472)")"
-          echo "Estimated files at 18 MiB each: $(python3 -c "print($JSON_ESTIMATE // 18874368)")"
-
-      - name: Sample joined records
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== SAMPLE RECORDS ==="
-          sqlite3 -json "$DB_URI" "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
-          echo ""
-          echo "=== SAMPLE LYRICSFILE (first 500 chars) ==="
-          sqlite3 "$DB_URI" "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
-
-      - name: Check for edge cases
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          echo "=== TRACKS WITH NULL name ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL artist_name ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL duration ==="
-          sqlite3 "$DB_URI" "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
-          echo ""
-          echo "=== DURATION RANGE ==="
-          sqlite3 "$DB_URI" "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
+      - name: Upload inspection report
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-inspection-report
+          path: db_inspection_report.json
 
       - name: Final disk space
         run: df -h /
