@@ -58,8 +58,12 @@ jobs:
           df -h /
 
           echo "=== DECOMPRESS + SPLIT + UPLOAD ==="
-          gzip -dc lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.sqlite3.part- &
-          SPLIT_PID=$!
+          pigz -dc lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.sqlite3.part- &
+          PIPE_PID=$!
+          # pigz runs as parent of split in the pipeline; find pigz PID
+          PIGZ_PID=$(pgrep -f "pigz -dc" | head -1)
+          SPLIT_PID=$(pgrep -f "split -b 1900M" | head -1)
+          echo "pigz PID: $PIGZ_PID, split PID: $SPLIT_PID"
 
           uploaded=0
           SAFETY_MARGIN=$((50 * 1024 * 1024))
@@ -68,15 +72,18 @@ jobs:
             sleep 10
 
             # Punch-hole on gzip file to reclaim read portions
-            for fd in /proc/$SPLIT_PID/fd/*; do
-              target=$(readlink "$fd" 2>/dev/null || true)
-              case "$target" in
-                *lrclib.sqlite3.gz)
-                  fd_num=$(basename "$fd")
-                  pos=$(cat "/proc/$SPLIT_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
-                  ;;
-              esac
-            done
+            pos=0
+            if [ -n "$PIGZ_PID" ] && [ -d "/proc/$PIGZ_PID" ]; then
+              for fd in /proc/$PIGZ_PID/fd/*; do
+                target=$(readlink "$fd" 2>/dev/null || true)
+                case "$target" in
+                  *lrclib.sqlite3.gz)
+                    fd_num=$(basename "$fd")
+                    pos=$(cat "/proc/$PIGZ_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
+                    ;;
+                esac
+              done
+            fi
             if [ -n "$pos" ] && [ "$pos" -gt "$SAFETY_MARGIN" ]; then
               hole_end=$((pos - SAFETY_MARGIN))
               fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
