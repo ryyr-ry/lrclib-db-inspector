@@ -3,22 +3,21 @@ name: Inspect LRCLIB DB Dump
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
-      - name: Maximize disk space (rm -rf only, no apt-get purge to protect PAM)
+      - name: Maximize disk space (rm -rf only, no apt-get purge)
         run: |
           echo "=== BEFORE ==="
           df -h /
-          # Remove everything via rm -rf only — apt-get purge --auto-remove
-          # destroys PAM modules and breaks sudo. rm -rf does not.
           sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache \
+            /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache \
             /usr/local/lib/node_modules \
             /usr/share/swift /usr/share/miniconda \
             /usr/local/aws-cli /usr/local/aws-sam-cli \
@@ -28,92 +27,99 @@ jobs:
             /usr/share/doc /usr/share/man /usr/share/info \
             /usr/share/locale /usr/lib/locale \
             /usr/share/i18n /usr/share/terminfo \
-            /usr/lib/x86_64-linux-gnu/libLLVM* \
-            /usr/lib/llvm-* /usr/lib/clang-* \
-            /usr/lib/firefox /usr/lib/firefox-addons \
-            /usr/lib/google-chrome \
-            /usr/lib/azure-cli \
-            /usr/lib/ruby* /usr/lib/r-* \
-            /usr/lib/php* /etc/php* \
-            /usr/lib/postgresql /usr/lib/mysql* \
-            /usr/lib/mono /usr/lib/haskell \
-            /usr/lib/ghc /usr/lib/ghcup \
-            /usr/lib/powershell \
-            /usr/lib/snap /snap \
-            /var/cache/apt /var/lib/apt/lists/* \
-            /var/log /var/cache /var/tmp \
-            /tmp/* /mnt \
-            /usr/local/share/gradle /usr/local/share/maven \
-            /usr/local/go /usr/local/cargo \
-            /usr/local/npm-global \
-            /opt/hostedtoolcache \
+            /var/lib/apt/lists/* /var/log /var/tmp /tmp/* /snap /mnt \
             2>/dev/null || true
-          # Docker images
           sudo docker system prune -af --volumes 2>/dev/null || true
-          sudo rm -rf /var/lib/docker 2>/dev/null || true
-          # Swap
           sudo swapoff -a 2>/dev/null || true
-          sudo rm -f /mnt/swapfile /swapfile 2>/dev/null || true
           echo "=== AFTER ==="
           df -h /
 
-      - name: Disk space before download
-        run: df -h /
-
-      - name: Download LRCLIB database dump
+      - name: Create release for parts
         run: |
-          aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
-            "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
+          gh release delete "db-dump-${{ github.run_id }}" --yes 2>/dev/null || true
+          gh release create "db-dump-${{ github.run_id }}" --target main \
+            --title "DB Parts" --notes "Temporary parts for decompression"
 
-      - name: Compressed file size and disk after download
-        run: |
-          ls -lh lrclib.sqlite3.gz
-          stat -c %s lrclib.sqlite3.gz
-          df -h /
-
-      - name: Decompress with punch-hole (gzip single-threaded for sync)
+      - name: Download, decompress to parts, upload as they complete
         run: |
           set -e
-          # gzip single-threaded: read position stays ~in sync with output
-          # pigz was parallel and read position lagged far behind output,
-          # causing peak disk usage to exceed available space
-          gzip -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
-          DECOMPRESS_PID=$!
-          sleep 2
+          RELEASE_TAG="db-dump-${{ github.run_id }}"
+          PART_SIZE=$((1900 * 1024 * 1024))
 
-          SAFETY_MARGIN=$((50 * 1024 * 1024))
+          echo "=== DOWNLOAD ==="
+          aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
+            "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
+          ls -lh lrclib.sqlite3.gz
+          df -h /
 
-          while kill -0 "$DECOMPRESS_PID" 2>/dev/null; do
-            sleep 3
+          echo "=== DECOMPRESS + SPLIT + UPLOAD ==="
+          gzip -dc lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.sqlite3.part- &
+          SPLIT_PID=$!
 
-            pos=0
-            for fd in /proc/$DECOMPRESS_PID/fd/*; do
-              target=$(readlink "$fd" 2>/dev/null || true)
-              case "$target" in
-                *lrclib.sqlite3.gz)
-                  fd_num=$(basename "$fd")
-                  pos=$(cat "/proc/$DECOMPRESS_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
-                  ;;
-              esac
+          uploaded=0
+          while kill -0 "$SPLIT_PID" 2>/dev/null; do
+            sleep 10
+            for part in lrclib.sqlite3.part-*; do
+              [ -f "$part" ] || continue
+              size=$(stat -c %s "$part" 2>/dev/null || echo 0)
+              if [ "$size" -ge "$PART_SIZE" ]; then
+                echo "Uploading $part ($(( size / 1073741824 )) GiB)..."
+                for attempt in 1 2 3; do
+                  if gh release upload "$RELEASE_TAG" "$part" --clobber; then
+                    break
+                  fi
+                  echo "Retry $attempt for $part"
+                  sleep 5
+                done
+                if [ "$attempt" -eq 3 ]; then
+                  echo "FAILED to upload $part after 3 attempts"
+                  exit 1
+                fi
+                rm "$part"
+                uploaded=$((uploaded + 1))
+                echo "Uploaded $uploaded parts so far"
+              fi
             done
-
-            if [ -n "$pos" ] && [ "$pos" -gt "$SAFETY_MARGIN" ]; then
-              hole_end=$((pos - SAFETY_MARGIN))
-              fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
-            fi
-
-            OUT_SIZE=$(stat -c %s lrclib.sqlite3 2>/dev/null || echo 0)
-            echo "output=$(echo "scale=1; $OUT_SIZE / 1073741824" | bc -l) GiB, gzip_pos=$(echo "scale=1; $pos / 1073741824" | bc -l) GiB"
             df -h / | tail -1
           done
 
-          wait "$DECOMPRESS_PID"
+          wait "$SPLIT_PID"
           echo "Decompression complete"
+
+          for part in lrclib.sqlite3.part-*; do
+            [ -f "$part" ] || continue
+            echo "Uploading final part $part..."
+            gh release upload "$RELEASE_TAG" "$part" --clobber
+            rm "$part"
+            uploaded=$((uploaded + 1))
+          done
+
           rm lrclib.sqlite3.gz
+          echo "=== ALL $uploaded PARTS UPLOADED ==="
           df -h /
 
-      - name: Decompressed file size and disk after decompression
+      - name: Download parts and recombine
         run: |
+          set -e
+          RELEASE_TAG="db-dump-${{ github.run_id }}"
+
+          PARTS=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort[]')
+
+          mkdir -p ./parts
+          touch lrclib.sqlite3
+
+          echo "$PARTS" | while read part; do
+            echo "Downloading $part..."
+            gh release download "$RELEASE_TAG" --pattern "$part" --dir ./parts/
+            cat "parts/$part" >> lrclib.sqlite3
+            rm "parts/$part"
+            SIZE=$(stat -c %s lrclib.sqlite3)
+            echo "Combined size: $(( SIZE / 1073741824 )) GiB"
+            df -h / | tail -1
+          done
+
+          rmdir ./parts
+          echo "=== RECOMBINATION COMPLETE ==="
           ls -lh lrclib.sqlite3
           stat -c %s lrclib.sqlite3
           df -h /
@@ -263,3 +269,9 @@ jobs:
 
       - name: Final disk space
         run: df -h /
+
+      - name: Cleanup release
+        if: always()
+        run: |
+          gh release delete "db-dump-${{ github.run_id }}" --yes 2>/dev/null || true
+          rm -f lrclib.sqlite3
