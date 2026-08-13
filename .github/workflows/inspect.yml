@@ -6,6 +6,9 @@ on:
 permissions:
   contents: write
 
+env:
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   inspect:
     runs-on: ubuntu-latest
@@ -57,15 +60,34 @@ jobs:
           SPLIT_PID=$!
 
           uploaded=0
+          SAFETY_MARGIN=$((50 * 1024 * 1024))
+
           while kill -0 "$SPLIT_PID" 2>/dev/null; do
             sleep 10
+
+            # Punch-hole on gzip file to reclaim read portions
+            for fd in /proc/$SPLIT_PID/fd/*; do
+              target=$(readlink "$fd" 2>/dev/null || true)
+              case "$target" in
+                *lrclib.sqlite3.gz)
+                  fd_num=$(basename "$fd")
+                  pos=$(cat "/proc/$SPLIT_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
+                  ;;
+              esac
+            done
+            if [ -n "$pos" ] && [ "$pos" -gt "$SAFETY_MARGIN" ]; then
+              hole_end=$((pos - SAFETY_MARGIN))
+              fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
+            fi
+
             for part in lrclib.sqlite3.part-*; do
               [ -f "$part" ] || continue
               size=$(stat -c %s "$part" 2>/dev/null || echo 0)
               if [ "$size" -ge "$PART_SIZE" ]; then
                 echo "Uploading $part ($(( size / 1073741824 )) GiB)..."
+                sha256sum "$part" > "${part}.sha256"
                 for attempt in 1 2 3; do
-                  if gh release upload "$RELEASE_TAG" "$part" --clobber; then
+                  if gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber; then
                     break
                   fi
                   echo "Retry $attempt for $part"
@@ -75,7 +97,7 @@ jobs:
                   echo "FAILED to upload $part after 3 attempts"
                   exit 1
                 fi
-                rm "$part"
+                rm "$part" "${part}.sha256"
                 uploaded=$((uploaded + 1))
                 echo "Uploaded $uploaded parts so far"
               fi
@@ -89,8 +111,9 @@ jobs:
           for part in lrclib.sqlite3.part-*; do
             [ -f "$part" ] || continue
             echo "Uploading final part $part..."
-            gh release upload "$RELEASE_TAG" "$part" --clobber
-            rm "$part"
+            sha256sum "$part" > "${part}.sha256"
+            gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber
+            rm "$part" "${part}.sha256"
             uploaded=$((uploaded + 1))
           done
 
@@ -103,7 +126,7 @@ jobs:
           set -e
           RELEASE_TAG="db-dump-${{ github.run_id }}"
 
-          PARTS=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort[]')
+          PARTS=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name | select(test("\\.sha256$") | not)] | sort[]')
 
           mkdir -p ./parts
           touch lrclib.sqlite3
@@ -111,6 +134,17 @@ jobs:
           echo "$PARTS" | while read part; do
             echo "Downloading $part..."
             gh release download "$RELEASE_TAG" --pattern "$part" --dir ./parts/
+            gh release download "$RELEASE_TAG" --pattern "${part}.sha256" --dir ./parts/
+
+            expected=$(awk '{print $1}' "parts/${part}.sha256")
+            actual=$(sha256sum "parts/$part" | awk '{print $1}')
+            if [ "$expected" != "$actual" ]; then
+              echo "SHA256 MISMATCH for $part: expected $expected, got $actual"
+              exit 1
+            fi
+            echo "SHA256 verified: $part"
+            rm "parts/${part}.sha256"
+
             cat "parts/$part" >> lrclib.sqlite3
             rm "parts/$part"
             SIZE=$(stat -c %s lrclib.sqlite3)
@@ -123,6 +157,12 @@ jobs:
           ls -lh lrclib.sqlite3
           stat -c %s lrclib.sqlite3
           df -h /
+
+      - name: Verify SQLite integrity
+        run: |
+          echo "=== INTEGRITY CHECK ==="
+          sqlite3 lrclib.sqlite3 "PRAGMA integrity_check;"
+          echo "=== INTEGRITY CHECK PASSED ==="
 
       - name: Inspect schema
         run: |
