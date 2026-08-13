@@ -34,7 +34,6 @@ jobs:
             /usr/share/doc /usr/share/man /usr/share/info \
             /usr/share/locale /usr/lib/locale \
             /usr/share/i18n /usr/share/terminfo \
-            /usr/lib/x86_64-linux-gnu/security \
             /lib/modules /usr/lib/firmware \
             /var/cache/apt /var/lib/apt/lists/* \
             /var/log /var/cache /var/tmp \
