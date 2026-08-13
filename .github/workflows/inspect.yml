@@ -10,20 +10,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space — remove preinstalled bloat
+      - name: Maximize free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Remove additional bloat
         run: |
           echo "=== BEFORE ==="
           df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache /usr/local/.ghcup \
-            /opt/az /opt/google /opt/pipx 2>/dev/null || true
+          # Aggressively remove everything not needed for our task
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache \
+            /opt/az /opt/google /opt/pipx \
+            /usr/share/swift /usr/share/miniconda \
+            /usr/local/aws-cli /usr/local/aws-sam-cli \
+            /usr/share/gradle /usr/local/julia \
+            /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/share/az* /usr/local/lib/node_modules 2>/dev/null || true
           sudo apt-get purge -y --auto-remove \
             'ghc-*' 'haskell-*' 'dotnet-*' 'aspnetcore-*' \
             'mono-*' 'ruby-*' 'r-base-*' \
             'mercurial*' 'subversion*' 'pandoc*' \
-            'firefox*' 'azure-cli*' 'amazon-ecr*' 2>/dev/null || true
+            'firefox*' 'azure-cli*' 'google-chrome*' \
+            'postgresql*' 'mysql*' 'mongodb*' \
+            'temurin-*' '*llvm*' 'powershell*' \
+            'amazon-ecr*' 'google-cloud-sdk*' 'google-cloud-cli*' 2>/dev/null || true
           sudo apt-get clean
           sudo docker system prune -af --volumes 2>/dev/null || true
+          # Remove apt caches
+          sudo rm -rf /var/cache/apt /var/lib/apt/lists/* 2>/dev/null || true
+          # Remove snap if present
+          sudo rm -rf /snap 2>/dev/null || true
           echo "=== AFTER ==="
           df -h /
 
