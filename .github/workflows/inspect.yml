@@ -8,64 +8,69 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Maximize free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Aggressive disk cleanup
+      - name: Maximize disk space (rm -rf only, no apt-get purge to protect PAM)
         run: |
           echo "=== BEFORE ==="
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache \
-            /opt/az /opt/google /opt/pipx \
+          # Remove everything via rm -rf only — apt-get purge --auto-remove
+          # destroys PAM modules and breaks sudo. rm -rf does not.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache \
+            /usr/local/lib/node_modules \
             /usr/share/swift /usr/share/miniconda \
             /usr/local/aws-cli /usr/local/aws-sam-cli \
             /usr/share/gradle /usr/local/julia \
             /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/share/az* /usr/local/lib/node_modules \
+            /usr/share/az* /opt/az /opt/google /opt/pipx \
             /usr/share/doc /usr/share/man /usr/share/info \
             /usr/share/locale /usr/lib/locale \
             /usr/share/i18n /usr/share/terminfo \
-            /lib/modules /usr/lib/firmware \
+            /usr/lib/x86_64-linux-gnu/libLLVM* \
+            /usr/lib/llvm-* /usr/lib/clang-* \
+            /usr/lib/firefox /usr/lib/firefox-addons \
+            /usr/lib/google-chrome \
+            /usr/lib/azure-cli \
+            /usr/lib/ruby* /usr/lib/r-* \
+            /usr/lib/php* /etc/php* \
+            /usr/lib/postgresql /usr/lib/mysql* \
+            /usr/lib/mono /usr/lib/haskell \
+            /usr/lib/ghc /usr/lib/ghcup \
+            /usr/lib/powershell \
+            /usr/lib/snap /snap \
             /var/cache/apt /var/lib/apt/lists/* \
             /var/log /var/cache /var/tmp \
-            /tmp/* /snap /mnt 2>/dev/null || true
-          sudo apt-get purge -y --auto-remove \
-            'ghc-*' 'haskell-*' 'dotnet-*' 'aspnetcore-*' \
-            'mono-*' 'ruby-*' 'r-base-*' \
-            'mercurial*' 'subversion*' 'pandoc*' \
-            'firefox*' 'azure-cli*' 'google-chrome*' \
-            'postgresql*' 'mysql*' 'mongodb*' \
-            'temurin-*' '*llvm*' 'powershell*' \
-            'amazon-ecr*' 'google-cloud-sdk*' 'google-cloud-cli*' \
-            '*chrome*' '*firefox*' '*thunderbird*' 2>/dev/null || true
-          sudo apt-get clean
+            /tmp/* /mnt \
+            /usr/local/share/gradle /usr/local/share/maven \
+            /usr/local/go /usr/local/cargo \
+            /usr/local/npm-global \
+            /opt/hostedtoolcache \
+            2>/dev/null || true
+          # Docker images
           sudo docker system prune -af --volumes 2>/dev/null || true
+          sudo rm -rf /var/lib/docker 2>/dev/null || true
+          # Swap
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /mnt/swapfile /swapfile 2>/dev/null || true
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install aria2 (static binary, no apt)
+      - name: Install aria2 (static binary, no apt, no sudo)
         run: |
-          wget -q -O /tmp/aria2c https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-x86_64-linux-gnu-1.tar.gz
-          tar xzf /tmp/aria2c -C /tmp
-          sudo cp /tmp/aria2-1.37.0-x86_64-linux-gnu-1/bin/aria2c /usr/local/bin/aria2c
-          sudo chmod +x /usr/local/bin/aria2c
-          rm -rf /tmp/aria2c /tmp/aria2-1.37.0-x86_64-linux-gnu-1
+          wget -q -O /tmp/aria2c.tar.gz https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-x86_64-linux-gnu-1.tar.gz
+          tar xzf /tmp/aria2c.tar.gz -C /tmp
+          cp /tmp/aria2-1.37.0-x86_64-linux-gnu-1/bin/aria2c ./aria2c
+          chmod +x ./aria2c
+          rm -rf /tmp/aria2c.tar.gz /tmp/aria2-1.37.0-x86_64-linux-gnu-1
 
       - name: Disk space before download
         run: df -h /
 
       - name: Download LRCLIB database dump
         run: |
-          aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
+          ./aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
 
       - name: Compressed file size and disk after download
