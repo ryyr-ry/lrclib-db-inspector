@@ -51,10 +51,10 @@ jobs:
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install aria2
+      - name: Install aria2 and pigz
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 pigz
 
       - name: Disk space before download
         run: df -h /
@@ -75,8 +75,8 @@ jobs:
       - name: Decompress with punch-hole on gzip to save disk
         run: |
           set -e
-          # Start decompression in background
-          gzip -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
+          # Start decompression in background (pigz = parallel gzip, ~4x faster)
+          pigz -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
           DECOMPRESS_PID=$!
 
           # Wait for the process to open the file
@@ -86,7 +86,7 @@ jobs:
           SAFETY_MARGIN=$((100 * 1024 * 1024))
 
           while kill -0 "$DECOMPRESS_PID" 2>/dev/null; do
-            sleep 10
+            sleep 5
 
             # Find the file descriptor position for lrclib.sqlite3.gz
             pos=0
