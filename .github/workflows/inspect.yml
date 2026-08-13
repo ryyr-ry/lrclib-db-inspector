@@ -32,7 +32,7 @@ jobs:
             /usr/share/doc /usr/share/man /usr/share/info \
             /usr/share/locale /usr/lib/locale \
             /usr/share/i18n /usr/share/terminfo \
-            /var/lib/apt/lists/* /var/log /var/tmp /tmp/* /snap /mnt \
+            /var/lib/apt/lists/* /var/tmp /tmp/* /snap /mnt \
             2>/dev/null || true
           sudo docker system prune -af --volumes 2>/dev/null || true
           sudo swapoff -a 2>/dev/null || true
@@ -41,9 +41,12 @@ jobs:
 
       - name: Install FUSE
         run: |
+          sudo mkdir -p /var/log/apt
           sudo apt-get update
           sudo apt-get install -y fuse libfuse2
-          ls -la /dev/fuse
+          ls -la /dev/fuse || echo "WARNING: /dev/fuse not found"
+          sudo modprobe fuse 2>/dev/null || true
+          ls -la /dev/fuse || echo "WARNING: /dev/fuse still not found after modprobe"
 
       - name: Install ratarmount
         run: |
