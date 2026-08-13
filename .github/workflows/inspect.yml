@@ -5,17 +5,17 @@ on:
 
 jobs:
   inspect:
-    runs-on: larger-runner
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install aria2 and sqlite3
+      - name: Install aria2
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 sqlite3
+          sudo apt-get install -y aria2
 
-      - name: Check available disk space
+      - name: Disk space before download
         run: df -h /
 
       - name: Download LRCLIB database dump
@@ -23,24 +23,63 @@ jobs:
           aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
 
-      - name: Check compressed size
+      - name: Compressed file size
         run: |
           ls -lh lrclib.sqlite3.gz
           stat -c %s lrclib.sqlite3.gz
 
-      - name: Check available disk space after download
+      - name: Disk space after download
         run: df -h /
 
-      - name: Decompress database
+      - name: Decompress with punch-hole on gzip to save disk
         run: |
-          gunzip lrclib.sqlite3.gz
+          set -e
+          # Start decompression in background
+          gzip -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
+          DECOMPRESS_PID=$!
 
-      - name: Check decompressed size
+          # Wait for the process to open the file
+          sleep 2
+
+          # Safety margin: 100 MB (gzip buffers ahead of kernel file position)
+          SAFETY_MARGIN=$((100 * 1024 * 1024))
+
+          while kill -0 "$DECOMPRESS_PID" 2>/dev/null; do
+            sleep 10
+
+            # Find the file descriptor position for lrclib.sqlite3.gz
+            pos=0
+            for fd in /proc/$DECOMPRESS_PID/fd/*; do
+              target=$(readlink "$fd" 2>/dev/null || true)
+              case "$target" in
+                *lrclib.sqlite3.gz)
+                  fd_num=$(basename "$fd")
+                  pos=$(cat "/proc/$DECOMPRESS_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
+                  ;;
+              esac
+            done
+
+            if [ -n "$pos" ] && [ "$pos" -gt "$SAFETY_MARGIN" ]; then
+              hole_end=$((pos - SAFETY_MARGIN))
+              fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
+            fi
+
+            # Report current disk usage
+            OUT_SIZE=$(stat -c %s lrclib.sqlite3 2>/dev/null || echo 0)
+            echo "Decompressing: output=$(echo "scale=1; $OUT_SIZE / 1073741824" | bc -l) GiB, gzip_pos=$(echo "scale=1; $pos / 1073741824" | bc -l) GiB"
+            df -h / | tail -1
+          done
+
+          wait "$DECOMPRESS_PID"
+          echo "Decompression complete"
+          rm lrclib.sqlite3.gz
+
+      - name: Decompressed file size
         run: |
           ls -lh lrclib.sqlite3
           stat -c %s lrclib.sqlite3
 
-      - name: Check available disk space after decompression
+      - name: Disk space after decompression
         run: df -h /
 
       - name: Inspect schema
@@ -54,14 +93,20 @@ jobs:
           echo "=== LYRICS SCHEMA ==="
           sqlite3 lrclib.sqlite3 ".schema lyrics"
           echo ""
-          echo "=== INDEXES ==="
+          echo "=== ALL INDEXES ==="
           sqlite3 lrclib.sqlite3 ".indexes"
           echo ""
-          echo "=== TRIGGERS ==="
+          echo "=== ALL TRIGGERS ==="
           sqlite3 lrclib.sqlite3 ".trigger"
           echo ""
           echo "=== FTS TABLES ==="
           sqlite3 lrclib.sqlite3 ".schema tracks_fts"
+          echo ""
+          echo "=== FLAGS TABLE ==="
+          sqlite3 lrclib.sqlite3 ".schema flags"
+          echo ""
+          echo "=== MISSING_TRACKS TABLE ==="
+          sqlite3 lrclib.sqlite3 ".schema missing_tracks"
 
       - name: Count records
         run: |
@@ -77,14 +122,14 @@ jobs:
           echo "=== LYRICS WITHOUT LYRICSFILE ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
           echo ""
+          echo "=== LYRICS WITH NULL LYRICSFILE COLUMN ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE lyricsfile IS NULL;"
+          echo ""
           echo "=== LYRICS WITH PLAIN LYRICS ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
           echo ""
           echo "=== LYRICS WITH SYNCED LYRICS ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
-          echo ""
-          echo "=== LYRICS WITH NULL LYRICSFILE ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE lyricsfile IS NULL;"
           echo ""
           echo "=== TRACKS WITH LAST_LYRICS_ID ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
@@ -94,9 +139,6 @@ jobs:
 
       - name: Measure field sizes
         run: |
-          echo "=== AVG TRACK ROW SIZE ==="
-          sqlite3 lrclib.sqlite3 "SELECT AVG(LENGTH(name) + LENGTH(name_lower) + LENGTH(artist_name) + LENGTH(artist_name_lower) + LENGTH(album_name) + LENGTH(album_name_lower) + 8 + 8 + 8 + 8) FROM tracks;"
-          echo ""
           echo "=== AVG LYRICS ROW SIZE ==="
           sqlite3 lrclib.sqlite3 "SELECT AVG(COALESCE(LENGTH(plain_lyrics),0) + COALESCE(LENGTH(synced_lyrics),0) + COALESCE(LENGTH(lyricsfile),0) + 8 + 1 + 1 + 1 + 1 + 1 + COALESCE(LENGTH(source),0) + 8 + 8) FROM lyrics;"
           echo ""
@@ -127,33 +169,9 @@ jobs:
           echo "=== TOTAL LYRICSFILE BYTES ==="
           sqlite3 lrclib.sqlite3 "SELECT SUM(LENGTH(lyricsfile)) FROM lyrics;"
 
-      - name: Estimate JSON export size
+      - name: Estimate JSON export size and chunk count
         run: |
-          echo "=== TOTAL BYTES (track + lyrics fields needed for API) ==="
-          sqlite3 lrclib.sqlite3 "SELECT SUM(
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.artist_name),0) +
-            COALESCE(LENGTH(t.album_name),0) +
-            8 +
-            1 +
-            COALESCE(LENGTH(l.plain_lyrics),0) +
-            COALESCE(LENGTH(l.synced_lyrics),0) +
-            COALESCE(LENGTH(l.lyricsfile),0)
-          )
-          FROM tracks t
-          LEFT JOIN lyrics l ON t.last_lyrics_id = l.id;"
-
-      - name: Sample joined records
-        run: |
-          echo "=== SAMPLE RECORD 1 ==="
-          sqlite3 -json lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
-          echo ""
-          echo "=== SAMPLE LYRICSFILE ==="
-          sqlite3 lrclib.sqlite3 "SELECT lyricsfile FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
-
-      - name: Estimate chunk count
-        run: |
+          echo "=== TOTAL API FIELD BYTES (joined tracks + lyrics) ==="
           TOTAL_BYTES=$(sqlite3 lrclib.sqlite3 "SELECT SUM(
             COALESCE(LENGTH(t.name),0) +
             COALESCE(LENGTH(t.name),0) +
@@ -167,47 +185,45 @@ jobs:
           )
           FROM tracks t
           LEFT JOIN lyrics l ON t.last_lyrics_id = l.id;")
-          echo "Total API field bytes (raw, no JSON overhead): $TOTAL_BYTES"
-          # JSON overhead: keys, quotes, braces, commas ~30-50% over raw text
-          # Estimate JSON size = raw * 1.4
+          echo "Total API field bytes (raw): $TOTAL_BYTES"
           JSON_ESTIMATE=$(echo "$TOTAL_BYTES * 1.4" | bc -l)
           echo "Estimated JSON size (with overhead): $JSON_ESTIMATE bytes"
           echo "Estimated JSON size (GB): $(echo "scale=2; $JSON_ESTIMATE / 1073741824" | bc -l) GB"
-          # 72 MiB per room = 75497472 bytes
           ROOMS=$(echo "scale=0; $JSON_ESTIMATE / 75497472" | bc -l)
           echo "Estimated rooms at 72 MiB each: $ROOMS"
-          # 18 MiB per file = 18874368 bytes
           FILES=$(echo "scale=0; $JSON_ESTIMATE / 18874368" | bc -l)
           echo "Estimated files at 18 MiB each: $FILES"
 
-      - name: Check for tracks without lyrics
+      - name: Sample joined records
         run: |
-          echo "=== TRACKS WITH NO LYRICS (last_lyrics_id IS NULL) ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
+          echo "=== SAMPLE RECORDS ==="
+          sqlite3 -json lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
           echo ""
-          echo "=== TRACKS WITH LYRICS BUT NO PLAIN AND NO SYNCED ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id WHERE l.id IS NOT NULL AND l.has_plain_lyrics = 0 AND l.has_synced_lyrics = 0;"
+          echo "=== SAMPLE LYRICSFILE (first 500 chars) ==="
+          sqlite3 lrclib.sqlite3 "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
 
-      - name: Duration distribution
+      - name: Check for edge cases
         run: |
-          echo "=== DURATION NULL ==="
+          echo "=== TRACKS WITH NULL name ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL name_lower ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name_lower IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL artist_name ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL artist_name_lower ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name_lower IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL duration ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
           echo ""
           echo "=== DURATION RANGE ==="
           sqlite3 lrclib.sqlite3 "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
-
-      - name: Check name_lower and artist_name_lower NULL
-        run: |
-          echo "=== TRACKS WITH NULL name_lower ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name_lower IS NULL;"
           echo ""
-          echo "=== TRACKS WITH NULL artist_name_lower ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name_lower IS NULL;"
+          echo "=== INSTRUMENTAL TRACKS ==="
+          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
 
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: db-inspection-results
-          path: |
-            *.txt
+      - name: Disk space after all operations
+        run: df -h /
