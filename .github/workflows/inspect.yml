@@ -8,8 +8,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
       - name: Maximize free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -21,11 +19,10 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Remove additional bloat
+      - name: Aggressive disk cleanup
         run: |
           echo "=== BEFORE ==="
           df -h /
-          # Aggressively remove everything not needed for our task
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache \
             /opt/az /opt/google /opt/pipx \
@@ -33,7 +30,15 @@ jobs:
             /usr/local/aws-cli /usr/local/aws-sam-cli \
             /usr/share/gradle /usr/local/julia \
             /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/share/az* /usr/local/lib/node_modules 2>/dev/null || true
+            /usr/share/az* /usr/local/lib/node_modules \
+            /usr/share/doc /usr/share/man /usr/share/info \
+            /usr/share/locale /usr/lib/locale \
+            /usr/share/i18n /usr/share/terminfo \
+            /usr/lib/x86_64-linux-gnu/security \
+            /lib/modules /usr/lib/firmware \
+            /var/cache/apt /var/lib/apt/lists/* \
+            /var/log /var/cache /var/tmp \
+            /tmp/* /snap /mnt 2>/dev/null || true
           sudo apt-get purge -y --auto-remove \
             'ghc-*' 'haskell-*' 'dotnet-*' 'aspnetcore-*' \
             'mono-*' 'ruby-*' 'r-base-*' \
@@ -41,20 +46,20 @@ jobs:
             'firefox*' 'azure-cli*' 'google-chrome*' \
             'postgresql*' 'mysql*' 'mongodb*' \
             'temurin-*' '*llvm*' 'powershell*' \
-            'amazon-ecr*' 'google-cloud-sdk*' 'google-cloud-cli*' 2>/dev/null || true
+            'amazon-ecr*' 'google-cloud-sdk*' 'google-cloud-cli*' \
+            '*chrome*' '*firefox*' '*thunderbird*' 2>/dev/null || true
           sudo apt-get clean
           sudo docker system prune -af --volumes 2>/dev/null || true
-          # Remove apt caches
-          sudo rm -rf /var/cache/apt /var/lib/apt/lists/* 2>/dev/null || true
-          # Remove snap if present
-          sudo rm -rf /snap 2>/dev/null || true
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install aria2 and pigz
+      - name: Install aria2 (static binary, no apt)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 pigz
+          wget -q -O /tmp/aria2c https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-x86_64-linux-gnu-1.tar.gz
+          tar xzf /tmp/aria2c -C /tmp
+          sudo cp /tmp/aria2-1.37.0-x86_64-linux-gnu-1/bin/aria2c /usr/local/bin/aria2c
+          sudo chmod +x /usr/local/bin/aria2c
+          rm -rf /tmp/aria2c /tmp/aria2-1.37.0-x86_64-linux-gnu-1
 
       - name: Disk space before download
         run: df -h /
@@ -64,31 +69,27 @@ jobs:
           aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
 
-      - name: Compressed file size
+      - name: Compressed file size and disk after download
         run: |
           ls -lh lrclib.sqlite3.gz
           stat -c %s lrclib.sqlite3.gz
+          df -h /
 
-      - name: Disk space after download
-        run: df -h /
-
-      - name: Decompress with punch-hole on gzip to save disk
+      - name: Decompress with punch-hole (gzip single-threaded for sync)
         run: |
           set -e
-          # Start decompression in background (pigz = parallel gzip, ~4x faster)
-          pigz -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
+          # gzip single-threaded: read position stays ~in sync with output
+          # pigz was parallel and read position lagged far behind output,
+          # causing peak disk usage to exceed available space
+          gzip -dc lrclib.sqlite3.gz > lrclib.sqlite3 &
           DECOMPRESS_PID=$!
-
-          # Wait for the process to open the file
           sleep 2
 
-          # Safety margin: 100 MB (gzip buffers ahead of kernel file position)
-          SAFETY_MARGIN=$((100 * 1024 * 1024))
+          SAFETY_MARGIN=$((50 * 1024 * 1024))
 
           while kill -0 "$DECOMPRESS_PID" 2>/dev/null; do
-            sleep 5
+            sleep 3
 
-            # Find the file descriptor position for lrclib.sqlite3.gz
             pos=0
             for fd in /proc/$DECOMPRESS_PID/fd/*; do
               target=$(readlink "$fd" 2>/dev/null || true)
@@ -105,23 +106,21 @@ jobs:
               fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
             fi
 
-            # Report current disk usage
             OUT_SIZE=$(stat -c %s lrclib.sqlite3 2>/dev/null || echo 0)
-            echo "Decompressing: output=$(echo "scale=1; $OUT_SIZE / 1073741824" | bc -l) GiB, gzip_pos=$(echo "scale=1; $pos / 1073741824" | bc -l) GiB"
+            echo "output=$(echo "scale=1; $OUT_SIZE / 1073741824" | bc -l) GiB, gzip_pos=$(echo "scale=1; $pos / 1073741824" | bc -l) GiB"
             df -h / | tail -1
           done
 
           wait "$DECOMPRESS_PID"
           echo "Decompression complete"
           rm lrclib.sqlite3.gz
+          df -h /
 
-      - name: Decompressed file size
+      - name: Decompressed file size and disk after decompression
         run: |
           ls -lh lrclib.sqlite3
           stat -c %s lrclib.sqlite3
-
-      - name: Disk space after decompression
-        run: df -h /
+          df -h /
 
       - name: Inspect schema
         run: |
@@ -266,5 +265,5 @@ jobs:
           echo "=== INSTRUMENTAL TRACKS ==="
           sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
 
-      - name: Disk space after all operations
+      - name: Final disk space
         run: df -h /
