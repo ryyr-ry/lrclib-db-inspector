@@ -16,32 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Maximize disk space
-        run: |
-          echo "=== BEFORE ==="
-          df -h /
-          sudo rm -rf \
-            /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache \
-            /usr/local/lib/node_modules \
-            /usr/share/swift /usr/share/miniconda \
-            /usr/local/aws-cli /usr/local/aws-sam-cli \
-            /usr/share/gradle /usr/local/julia \
-            /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/share/az* /opt/az /opt/google /opt/pipx \
-            /usr/share/doc /usr/share/man /usr/share/info \
-            /usr/share/locale /usr/lib/locale \
-            /usr/share/i18n /usr/share/terminfo \
-            /var/lib/apt/lists/* /var/tmp /tmp/* /snap /mnt \
-            2>/dev/null || true
-          sudo docker system prune -af --volumes 2>/dev/null || true
-          sudo swapoff -a 2>/dev/null || true
-          echo "=== AFTER ==="
-          df -h /
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Install FUSE
         run: |
-          sudo mkdir -p /var/log/apt
           sudo apt-get update
           sudo apt-get install -y fuse libfuse2
           ls -la /dev/fuse || echo "WARNING: /dev/fuse not found"
