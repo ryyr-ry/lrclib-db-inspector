@@ -50,7 +50,7 @@ jobs:
           gh release create "db-dump-${{ github.run_id }}" --target main \
             --title "DB Parts" --notes "Temporary parts for decompression"
 
-      - name: Download, decompress (rapidgzip), split, upload in parallel
+      - name: Download, decompress (rapidgzip), split, async upload
         run: |
           set -e
           RELEASE_TAG="db-dump-${{ github.run_id }}"
@@ -62,61 +62,78 @@ jobs:
           ls -lh lrclib.sqlite3.gz
           df -h /
 
-          echo "=== DECOMPRESS (rapidgzip) + SPLIT + UPLOAD ==="
-          # 3 parallel processes:
-          # 1. rapidgzip: true parallel gzip decompression (not single-threaded like pigz)
-          # 2. punch-hole on gzip file as rapidgzip reads it
-          # 3. upload completed parts to GitHub Release, then delete locally
+          echo "=== DECOMPRESS + SPLIT + ASYNC UPLOAD ==="
+          # 3 truly parallel processes:
+          # 1. rapidgzip decompresses in parallel (multi-core) → split writes parts
+          # 2. Background loop: punch-hole on gzip to reclaim read space
+          # 3. Background loop: upload completed parts and delete them
+          #
+          # Uploads run in background (&), so decompression is never blocked.
+          # Peak disk: gzip_remain (shrinks via punch-hole) + few parts (uploaded+deleted fast)
+
+          # Start decompression + split
           rapidgzip -d -c -P 0 lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.part- &
           SPLIT_PID=$!
-          RAPIDGZIP_PID=$(pgrep -P "$SPLIT_PID" rapidgzip || pgrep -x rapidgzip | head -1)
-          echo "rapidgzip PID: $RAPIDGZIP_PID, split PID: $SPLIT_PID"
 
+          # Start punch-hole loop in background
+          (
+            SAFETY_MARGIN=$((50 * 1024 * 1024))
+            while kill -0 "$SPLIT_PID" 2>/dev/null; do
+              sleep 3
+              pos=0
+              # Find the actual gzip reader fd by scanning all rapidgzip processes
+              for pid in $(pgrep -f rapidgzip); do
+                for fd in /proc/$pid/fd/*; do
+                  target=$(readlink "$fd" 2>/dev/null || true)
+                  case "$target" in
+                    *lrclib.sqlite3.gz)
+                      fd_num=$(basename "$fd")
+                      p=$(cat "/proc/$pid/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
+                      if [ -n "$p" ] && [ "$p" -gt "$pos" ]; then
+                        pos=$p
+                      fi
+                      ;;
+                  esac
+                done
+              done
+              if [ "$pos" -gt "$SAFETY_MARGIN" ]; then
+                hole_end=$((pos - SAFETY_MARGIN))
+                fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
+              fi
+            done
+          ) &
+          PUNCH_PID=$!
+
+          # Start upload loop in background
           uploaded=0
-          SAFETY_MARGIN=$((50 * 1024 * 1024))
+          upload_part() {
+            local part="$1"
+            local size=$(stat -c %s "$part" 2>/dev/null || echo 0)
+            echo "Uploading $part ($(( size / 1073741824 )) GiB)..."
+            sha256sum "$part" > "${part}.sha256"
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber; then
+                break
+              fi
+              echo "Retry $attempt for $part"
+              sleep 5
+            done
+            if [ "$attempt" -eq 5 ]; then
+              echo "FAILED to upload $part after 5 attempts"
+              exit 1
+            fi
+            rm "$part" "${part}.sha256"
+            uploaded=$((uploaded + 1))
+            echo "Uploaded $uploaded parts so far"
+          }
 
           while kill -0 "$SPLIT_PID" 2>/dev/null; do
             sleep 5
-
-            # Process 2: punch-hole on gzip file
-            pos=0
-            if [ -n "$RAPIDGZIP_PID" ] && [ -d "/proc/$RAPIDGZIP_PID" ]; then
-              for fd in /proc/$RAPIDGZIP_PID/fd/*; do
-                target=$(readlink "$fd" 2>/dev/null || true)
-                case "$target" in
-                  *lrclib.sqlite3.gz)
-                    fd_num=$(basename "$fd")
-                    pos=$(cat "/proc/$RAPIDGZIP_PID/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
-                    ;;
-                esac
-              done
-            fi
-            if [ -n "$pos" ] && [ "$pos" -gt "$SAFETY_MARGIN" ]; then
-              hole_end=$((pos - SAFETY_MARGIN))
-              fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
-            fi
-
-            # Process 3: upload completed parts
             for part in lrclib.part-*; do
               [ -f "$part" ] || continue
               size=$(stat -c %s "$part" 2>/dev/null || echo 0)
               if [ "$size" -ge "$PART_SIZE" ]; then
-                echo "Uploading $part ($(( size / 1073741824 )) GiB)..."
-                sha256sum "$part" > "${part}.sha256"
-                for attempt in 1 2 3; do
-                  if gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber; then
-                    break
-                  fi
-                  echo "Retry $attempt for $part"
-                  sleep 5
-                done
-                if [ "$attempt" -eq 3 ]; then
-                  echo "FAILED to upload $part after 3 attempts"
-                  exit 1
-                fi
-                rm "$part" "${part}.sha256"
-                uploaded=$((uploaded + 1))
-                echo "Uploaded $uploaded parts so far"
+                upload_part "$part" &
               fi
             done
             df -h / | tail -1
@@ -124,18 +141,18 @@ jobs:
 
           wait "$SPLIT_PID"
           echo "Decompression complete"
+          kill "$PUNCH_PID" 2>/dev/null || true
 
+          # Upload any remaining parts (including the last partial one)
           for part in lrclib.part-*; do
             [ -f "$part" ] || continue
-            echo "Uploading final part $part..."
-            sha256sum "$part" > "${part}.sha256"
-            gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber
-            rm "$part" "${part}.sha256"
-            uploaded=$((uploaded + 1))
+            upload_part "$part"
           done
 
+          # Wait for all background uploads
+          wait
           rm lrclib.sqlite3.gz
-          echo "=== ALL $uploaded PARTS UPLOADED ==="
+          echo "=== ALL PARTS UPLOADED ==="
           df -h /
 
       - name: Download parts and recombine
