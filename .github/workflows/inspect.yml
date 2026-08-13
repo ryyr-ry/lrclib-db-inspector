@@ -12,7 +12,7 @@ env:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -44,308 +44,35 @@ jobs:
           python3 -m pip install --user --break-system-packages rapidgzip
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Create release for parts
+      - name: Download DB dump
         run: |
-          gh release delete "db-dump-${{ github.run_id }}" --yes 2>/dev/null || true
-          gh release create "db-dump-${{ github.run_id }}" --target main \
-            --title "DB Parts" --notes "Temporary parts for decompression"
-
-      - name: Download, decompress (rapidgzip), split, async upload
-        run: |
-          set -e
-          RELEASE_TAG="db-dump-${{ github.run_id }}"
-          PART_SIZE=$((1900 * 1024 * 1024))
-
           echo "=== DOWNLOAD ==="
           aria2c -x 16 -s 16 -o lrclib.sqlite3.gz \
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
+          echo "=== DOWNLOADED ==="
           ls -lh lrclib.sqlite3.gz
+          stat -c %s lrclib.sqlite3.gz
           df -h /
 
-          echo "=== DECOMPRESS + SPLIT + ASYNC UPLOAD ==="
-          # 3 truly parallel processes:
-          # 1. rapidgzip decompresses in parallel (multi-core) → split writes parts
-          # 2. Background loop: punch-hole on gzip to reclaim read space
-          # 3. Background loop: upload completed parts and delete them
-          #
-          # Uploads run in background (&), so decompression is never blocked.
-          # Peak disk: gzip_remain (shrinks via punch-hole) + few parts (uploaded+deleted fast)
-
-          # Start decompression + split
-          rapidgzip -d -c -P 0 lrclib.sqlite3.gz | split -b 1900M -d -a 2 - lrclib.part- &
-          SPLIT_PID=$!
-
-          # Start punch-hole loop in background
-          (
-            SAFETY_MARGIN=$((50 * 1024 * 1024))
-            while kill -0 "$SPLIT_PID" 2>/dev/null; do
-              sleep 3
-              pos=0
-              # Find the actual gzip reader fd by scanning all rapidgzip processes
-              for pid in $(pgrep -f rapidgzip); do
-                for fd in /proc/$pid/fd/*; do
-                  target=$(readlink "$fd" 2>/dev/null || true)
-                  case "$target" in
-                    *lrclib.sqlite3.gz)
-                      fd_num=$(basename "$fd")
-                      p=$(cat "/proc/$pid/fdinfo/$fd_num" 2>/dev/null | awk '/^pos:/{print $2}')
-                      if [ -n "$p" ] && [ "$p" -gt "$pos" ]; then
-                        pos=$p
-                      fi
-                      ;;
-                  esac
-                done
-              done
-              if [ "$pos" -gt "$SAFETY_MARGIN" ]; then
-                hole_end=$((pos - SAFETY_MARGIN))
-                fallocate --punch-hole --offset 0 --length "$hole_end" lrclib.sqlite3.gz 2>/dev/null || true
-              fi
-            done
-          ) &
-          PUNCH_PID=$!
-
-          # Start upload loop in background
-          uploaded=0
-          upload_part() {
-            local part="$1"
-            local size=$(stat -c %s "$part" 2>/dev/null || echo 0)
-            echo "Uploading $part ($(( size / 1073741824 )) GiB)..."
-            sha256sum "$part" > "${part}.sha256"
-            for attempt in 1 2 3 4 5; do
-              if gh release upload "$RELEASE_TAG" "$part" "${part}.sha256" --clobber; then
-                break
-              fi
-              echo "Retry $attempt for $part"
-              sleep 5
-            done
-            if [ "$attempt" -eq 5 ]; then
-              echo "FAILED to upload $part after 5 attempts"
-              exit 1
-            fi
-            rm "$part" "${part}.sha256"
-            uploaded=$((uploaded + 1))
-            echo "Uploaded $uploaded parts so far"
-          }
-
-          while kill -0 "$SPLIT_PID" 2>/dev/null; do
-            sleep 5
-            for part in lrclib.part-*; do
-              [ -f "$part" ] || continue
-              size=$(stat -c %s "$part" 2>/dev/null || echo 0)
-              if [ "$size" -ge "$PART_SIZE" ]; then
-                upload_part "$part" &
-              fi
-            done
-            df -h / | tail -1
-          done
-
-          wait "$SPLIT_PID"
-          echo "Decompression complete"
-          kill "$PUNCH_PID" 2>/dev/null || true
-
-          # Upload any remaining parts (including the last partial one)
-          for part in lrclib.part-*; do
-            [ -f "$part" ] || continue
-            upload_part "$part"
-          done
-
-          # Wait for all background uploads
-          wait
-          rm lrclib.sqlite3.gz
-          echo "=== ALL PARTS UPLOADED ==="
+      - name: Measure decompressed size (no disk write)
+        run: |
+          echo "=== MEASURING DECOMPRESSED SIZE ==="
+          echo "Piping rapidgzip -> wc -c (no disk write for decompressed data)"
+          START=$(date +%s)
+          BYTES=$(rapidgzip -d -c -P 0 lrclib.sqlite3.gz | wc -c)
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "=== RESULT ==="
+          echo "Decompressed size: $BYTES bytes"
+          echo "Decompressed size: $((BYTES / 1073741824)) GiB"
+          echo "Decompressed size: $((BYTES / 1000000000)) GB (decimal)"
+          echo "Elapsed: ${ELAPSED}s"
+          echo "Throughput: $((BYTES / ELAPSED / 1048576)) MiB/s"
+          echo "Compression ratio: $(echo "scale=2; $BYTES / $(stat -c %s lrclib.sqlite3.gz)" | bc -l)x"
           df -h /
 
-      - name: Download parts and recombine
-        run: |
-          set -e
-          RELEASE_TAG="db-dump-${{ github.run_id }}"
-
-          PARTS=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name | select(test("\\.sha256$") | not)] | sort[]')
-
-          mkdir -p ./parts
-          touch lrclib.sqlite3
-
-          echo "$PARTS" | while read part; do
-            echo "Downloading $part..."
-            gh release download "$RELEASE_TAG" --pattern "$part" --dir ./parts/
-            gh release download "$RELEASE_TAG" --pattern "${part}.sha256" --dir ./parts/
-
-            expected=$(awk '{print $1}' "parts/${part}.sha256")
-            actual=$(sha256sum "parts/$part" | awk '{print $1}')
-            if [ "$expected" != "$actual" ]; then
-              echo "SHA256 MISMATCH for $part: expected $expected, got $actual"
-              exit 1
-            fi
-            echo "SHA256 verified: $part"
-            rm "parts/${part}.sha256"
-
-            cat "parts/$part" >> lrclib.sqlite3
-            rm "parts/$part"
-            SIZE=$(stat -c %s lrclib.sqlite3)
-            echo "Combined size: $(( SIZE / 1073741824 )) GiB"
-            df -h / | tail -1
-          done
-
-          rmdir ./parts
-          echo "=== RECOMBINATION COMPLETE ==="
-          ls -lh lrclib.sqlite3
-          stat -c %s lrclib.sqlite3
-          df -h /
-
-      - name: Verify integrity
-        run: |
-          echo "=== INTEGRITY CHECK ==="
-          sqlite3 lrclib.sqlite3 "PRAGMA integrity_check;"
-          echo "=== INTEGRITY CHECK PASSED ==="
-
-      - name: Inspect schema
-        run: |
-          echo "=== TABLES ==="
-          sqlite3 lrclib.sqlite3 ".tables"
-          echo ""
-          echo "=== TRACKS SCHEMA ==="
-          sqlite3 lrclib.sqlite3 ".schema tracks"
-          echo ""
-          echo "=== LYRICS SCHEMA ==="
-          sqlite3 lrclib.sqlite3 ".schema lyrics"
-          echo ""
-          echo "=== ALL INDEXES ==="
-          sqlite3 lrclib.sqlite3 ".indexes"
-          echo ""
-          echo "=== ALL TRIGGERS ==="
-          sqlite3 lrclib.sqlite3 ".trigger"
-          echo ""
-          echo "=== FTS TABLES ==="
-          sqlite3 lrclib.sqlite3 ".schema tracks_fts"
-          echo ""
-          echo "=== FLAGS TABLE ==="
-          sqlite3 lrclib.sqlite3 ".schema flags"
-          echo ""
-          echo "=== MISSING_TRACKS TABLE ==="
-          sqlite3 lrclib.sqlite3 ".schema missing_tracks"
-
-      - name: Count records
-        run: |
-          echo "=== TRACK COUNT ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks;"
-          echo ""
-          echo "=== LYRICS COUNT ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics;"
-          echo ""
-          echo "=== LYRICS WITH LYRICSFILE ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 1;"
-          echo ""
-          echo "=== LYRICS WITHOUT LYRICSFILE ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
-          echo ""
-          echo "=== LYRICS WITH NULL LYRICSFILE COLUMN ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE lyricsfile IS NULL;"
-          echo ""
-          echo "=== LYRICS WITH PLAIN LYRICS ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
-          echo ""
-          echo "=== LYRICS WITH SYNCED LYRICS ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
-          echo ""
-          echo "=== TRACKS WITH LAST_LYRICS_ID ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
-          echo ""
-          echo "=== TRACKS WITHOUT LAST_LYRICS_ID ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
-
-      - name: Measure field sizes
-        run: |
-          echo "=== AVG LYRICS ROW SIZE ==="
-          sqlite3 lrclib.sqlite3 "SELECT AVG(COALESCE(LENGTH(plain_lyrics),0) + COALESCE(LENGTH(synced_lyrics),0) + COALESCE(LENGTH(lyricsfile),0) + 8 + 1 + 1 + 1 + 1 + 1 + COALESCE(LENGTH(source),0) + 8 + 8) FROM lyrics;"
-          echo ""
-          echo "=== AVG PLAIN_LYRICS LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT AVG(LENGTH(plain_lyrics)) FROM lyrics WHERE plain_lyrics IS NOT NULL;"
-          echo ""
-          echo "=== AVG SYNCED_LYRICS LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT AVG(LENGTH(synced_lyrics)) FROM lyrics WHERE synced_lyrics IS NOT NULL;"
-          echo ""
-          echo "=== AVG LYRICSFILE LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT AVG(LENGTH(lyricsfile)) FROM lyrics WHERE lyricsfile IS NOT NULL;"
-          echo ""
-          echo "=== MAX PLAIN_LYRICS LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT MAX(LENGTH(plain_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== MAX SYNCED_LYRICS LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT MAX(LENGTH(synced_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== MAX LYRICSFILE LENGTH ==="
-          sqlite3 lrclib.sqlite3 "SELECT MAX(LENGTH(lyricsfile)) FROM lyrics;"
-          echo ""
-          echo "=== TOTAL PLAIN_LYRICS BYTES ==="
-          sqlite3 lrclib.sqlite3 "SELECT SUM(LENGTH(plain_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== TOTAL SYNCED_LYRICS BYTES ==="
-          sqlite3 lrclib.sqlite3 "SELECT SUM(LENGTH(synced_lyrics)) FROM lyrics;"
-          echo ""
-          echo "=== TOTAL LYRICSFILE BYTES ==="
-          sqlite3 lrclib.sqlite3 "SELECT SUM(LENGTH(lyricsfile)) FROM lyrics;"
-
-      - name: Estimate JSON export size and chunk count
-        run: |
-          echo "=== TOTAL API FIELD BYTES (joined tracks + lyrics) ==="
-          TOTAL_BYTES=$(sqlite3 lrclib.sqlite3 "SELECT SUM(
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.name),0) +
-            COALESCE(LENGTH(t.artist_name),0) +
-            COALESCE(LENGTH(t.album_name),0) +
-            8 +
-            1 +
-            COALESCE(LENGTH(l.plain_lyrics),0) +
-            COALESCE(LENGTH(l.synced_lyrics),0) +
-            COALESCE(LENGTH(l.lyricsfile),0)
-          )
-          FROM tracks t
-          LEFT JOIN lyrics l ON t.last_lyrics_id = l.id;")
-          echo "Total API field bytes (raw): $TOTAL_BYTES"
-          JSON_ESTIMATE=$(echo "$TOTAL_BYTES * 1.4" | bc -l)
-          echo "Estimated JSON size (with overhead): $JSON_ESTIMATE bytes"
-          echo "Estimated JSON size (GB): $(echo "scale=2; $JSON_ESTIMATE / 1073741824" | bc -l) GB"
-          ROOMS=$(echo "scale=0; $JSON_ESTIMATE / 75497472" | bc -l)
-          echo "Estimated rooms at 72 MiB each: $ROOMS"
-          FILES=$(echo "scale=0; $JSON_ESTIMATE / 18874368" | bc -l)
-          echo "Estimated files at 18 MiB each: $FILES"
-
-      - name: Sample joined records
-        run: |
-          echo "=== SAMPLE RECORDS ==="
-          sqlite3 -json lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
-          echo ""
-          echo "=== SAMPLE LYRICSFILE (first 500 chars) ==="
-          sqlite3 lrclib.sqlite3 "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
-
-      - name: Check for edge cases
-        run: |
-          echo "=== TRACKS WITH NULL name ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL name_lower ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name_lower IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL artist_name ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL artist_name_lower ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name_lower IS NULL;"
-          echo ""
-          echo "=== TRACKS WITH NULL duration ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
-          echo ""
-          echo "=== DURATION RANGE ==="
-          sqlite3 lrclib.sqlite3 "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
-          echo ""
-          echo "=== INSTRUMENTAL TRACKS ==="
-          sqlite3 lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
-
-      - name: Final disk space
-        run: df -h /
-
-      - name: Cleanup release
+      - name: Cleanup
         if: always()
         run: |
-          gh release delete "db-dump-${{ github.run_id }}" --yes 2>/dev/null || true
-          rm -f lrclib.sqlite3
+          rm -f lrclib.sqlite3.gz
+          df -h /
