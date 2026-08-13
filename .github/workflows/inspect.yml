@@ -12,7 +12,7 @@ env:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +39,18 @@ jobs:
           echo "=== AFTER ==="
           df -h /
 
-      - name: Install rapidgzip
+      - name: Install FUSE
         run: |
-          python3 -m pip install --user --break-system-packages rapidgzip
+          sudo apt-get update
+          sudo apt-get install -y fuse libfuse2
+          ls -la /dev/fuse
+
+      - name: Install ratarmount
+        run: |
+          python3 -m pip install --user --break-system-packages ratarmount
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          which ratarmount
+          ratarmount --version
 
       - name: Download DB dump
         run: |
@@ -54,25 +62,140 @@ jobs:
           stat -c %s lrclib.sqlite3.gz
           df -h /
 
-      - name: Measure decompressed size (no disk write)
+      - name: Mount gzip via ratarmount
         run: |
-          echo "=== MEASURING DECOMPRESSED SIZE ==="
-          echo "Piping rapidgzip -> wc -c (no disk write for decompressed data)"
+          echo "=== MOUNTING ==="
+          mkdir -p /mnt/sqlite
           START=$(date +%s)
-          BYTES=$(rapidgzip -d -c -P 0 lrclib.sqlite3.gz | wc -c)
+          ratarmount -P 0 lrclib.sqlite3.gz /mnt/sqlite 2>&1
           END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "=== RESULT ==="
-          echo "Decompressed size: $BYTES bytes"
-          echo "Decompressed size: $((BYTES / 1073741824)) GiB"
-          echo "Decompressed size: $((BYTES / 1000000000)) GB (decimal)"
-          echo "Elapsed: ${ELAPSED}s"
-          echo "Throughput: $((BYTES / ELAPSED / 1048576)) MiB/s"
-          echo "Compression ratio: $(echo "scale=2; $BYTES / $(stat -c %s lrclib.sqlite3.gz)" | bc -l)x"
+          echo "Mount time: $((END - START))s"
+          echo "=== MOUNTED ==="
+          ls -la /mnt/sqlite/
           df -h /
 
-      - name: Cleanup
+      - name: Verify SQLite access via FUSE
+        run: |
+          echo "=== SQLITE ACCESS TEST ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "PRAGMA integrity_check;"
+          echo "=== TABLES ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 ".tables"
+
+      - name: Inspect schema
+        run: |
+          echo "=== TRACKS SCHEMA ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 ".schema tracks"
+          echo ""
+          echo "=== LYRICS SCHEMA ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 ".schema lyrics"
+          echo ""
+          echo "=== ALL INDEXES ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 ".indexes"
+          echo ""
+          echo "=== ALL TRIGGERS ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 ".trigger"
+
+      - name: Count records
+        run: |
+          echo "=== TRACK COUNT ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks;"
+          echo ""
+          echo "=== LYRICS COUNT ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics;"
+          echo ""
+          echo "=== LYRICS WITH LYRICSFILE ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 1;"
+          echo ""
+          echo "=== LYRICS WITHOUT LYRICSFILE ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_lyricsfile = 0 OR has_lyricsfile IS NULL;"
+          echo ""
+          echo "=== LYRICS WITH PLAIN LYRICS ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_plain_lyrics = 1;"
+          echo ""
+          echo "=== LYRICS WITH SYNCED LYRICS ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE has_synced_lyrics = 1;"
+          echo ""
+          echo "=== TRACKS WITH LAST_LYRICS_ID ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NOT NULL;"
+          echo ""
+          echo "=== TRACKS WITHOUT LAST_LYRICS_ID ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE last_lyrics_id IS NULL;"
+          echo ""
+          echo "=== INSTRUMENTAL TRACKS ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM lyrics WHERE instrumental = 1;"
+
+      - name: Measure field sizes
+        run: |
+          echo "=== AVG PLAIN_LYRICS LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(plain_lyrics)) FROM lyrics WHERE plain_lyrics IS NOT NULL;"
+          echo ""
+          echo "=== AVG SYNCED_LYRICS LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(synced_lyrics)) FROM lyrics WHERE synced_lyrics IS NOT NULL;"
+          echo ""
+          echo "=== AVG LYRICSFILE LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT AVG(LENGTH(lyricsfile)) FROM lyrics WHERE lyricsfile IS NOT NULL;"
+          echo ""
+          echo "=== MAX PLAIN_LYRICS LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(plain_lyrics)) FROM lyrics;"
+          echo ""
+          echo "=== MAX SYNCED_LYRICS LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(synced_lyrics)) FROM lyrics;"
+          echo ""
+          echo "=== MAX LYRICSFILE LENGTH ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT MAX(LENGTH(lyricsfile)) FROM lyrics;"
+
+      - name: Estimate JSON export size
+        run: |
+          echo "=== TOTAL API FIELD BYTES (joined tracks + lyrics) ==="
+          TOTAL_BYTES=$(sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT SUM(
+            COALESCE(LENGTH(t.name),0) +
+            COALESCE(LENGTH(t.name),0) +
+            COALESCE(LENGTH(t.artist_name),0) +
+            COALESCE(LENGTH(t.album_name),0) +
+            8 +
+            1 +
+            COALESCE(LENGTH(l.plain_lyrics),0) +
+            COALESCE(LENGTH(l.synced_lyrics),0) +
+            COALESCE(LENGTH(l.lyricsfile),0)
+          )
+          FROM tracks t
+          LEFT JOIN lyrics l ON t.last_lyrics_id = l.id;")
+          echo "Total API field bytes (raw): $TOTAL_BYTES"
+          JSON_ESTIMATE=$(python3 -c "print(int($TOTAL_BYTES * 1.4))")
+          echo "Estimated JSON size (with overhead): $JSON_ESTIMATE bytes"
+          echo "Estimated JSON size (GB): $(python3 -c "print(f'{$JSON_ESTIMATE / 1073741824:.2f}')") GB"
+          echo "Estimated rooms at 72 MiB each: $(python3 -c "print($JSON_ESTIMATE // 75497472)")"
+          echo "Estimated files at 18 MiB each: $(python3 -c "print($JSON_ESTIMATE // 18874368)")"
+
+      - name: Sample joined records
+        run: |
+          echo "=== SAMPLE RECORDS ==="
+          sqlite3 -json /mnt/sqlite/lrclib.sqlite3 "SELECT t.id, t.name, t.artist_name, t.album_name, t.duration, l.instrumental, LENGTH(l.plain_lyrics) as plain_len, LENGTH(l.synced_lyrics) as synced_len, LENGTH(l.lyricsfile) as lyricsfile_len, l.has_lyricsfile FROM tracks t LEFT JOIN lyrics l ON t.last_lyrics_id = l.id LIMIT 5;"
+          echo ""
+          echo "=== SAMPLE LYRICSFILE (first 500 chars) ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT SUBSTR(lyricsfile, 1, 500) FROM lyrics WHERE lyricsfile IS NOT NULL LIMIT 1;"
+
+      - name: Check for edge cases
+        run: |
+          echo "=== TRACKS WITH NULL name ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE name IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL artist_name ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE artist_name IS NULL;"
+          echo ""
+          echo "=== TRACKS WITH NULL duration ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT COUNT(*) FROM tracks WHERE duration IS NULL;"
+          echo ""
+          echo "=== DURATION RANGE ==="
+          sqlite3 /mnt/sqlite/lrclib.sqlite3 "SELECT MIN(duration), MAX(duration), AVG(duration) FROM tracks WHERE duration IS NOT NULL;"
+
+      - name: Final disk space
+        run: df -h /
+
+      - name: Unmount and cleanup
         if: always()
         run: |
+          fusermount -u /mnt/sqlite 2>/dev/null || true
           rm -f lrclib.sqlite3.gz
+          rm -f .*.index.sqlite
           df -h /
