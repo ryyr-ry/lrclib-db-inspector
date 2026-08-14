@@ -2,7 +2,9 @@
 """
 Inspect LRCLIB SQLite DB through RapidgzipFile + APSW custom VFS.
 No FUSE, no ratarmount, no disk decompression.
-SQLite reads pages through a custom VFS backed by RapidgzipFile.
+
+Based on the sqlite-memory-vfs pattern: VFSFile is a plain Python class
+(not inheriting from apsw.VFSFile) that implements all VFS file methods.
 """
 
 import os
@@ -10,31 +12,23 @@ import sys
 import json
 import time
 import struct
-import tempfile
 import apsw
 from rapidgzip import RapidgzipFile
 
 GZIP_PATH = sys.argv[1]
 
 
-class GzipVFSFile(apsw.VFSFile):
-    """VFS file handle backed by a shared RapidgzipFile.
+class GzipVFSFile:
+    """Plain Python VFS file backed by a shared RapidgzipFile.
 
-    We create a real temp file so APSW's VFSFile.__init__ succeeds
-    (opening it via the default VFS), then override xRead and xFilesize
-    to serve data from RapidgzipFile instead.
+    Does NOT inherit from apsw.VFSFile to avoid xOpen recursion.
+    Implements all required VFSFile methods directly.
     """
 
-    def __init__(self, vfs_name, filename, flags, gz_file, db_size):
-        # Create a temp file and let the default VFS open it
-        self._tmpfile = tempfile.NamedTemporaryFile(
-            prefix="gzipvfs_", suffix=".sqlite", delete=False
-        )
-        self._tmpfile.write(b"\x00" * min(db_size, 4096))
-        self._tmpfile.close()
-        super().__init__("", self._tmpfile.name, flags)
+    def __init__(self, gz_file, db_size):
         self._gz = gz_file
         self._size = db_size
+        self._level = apsw.SQLITE_LOCK_NONE
 
     def xRead(self, amount, offset):
         self._gz.seek(offset)
@@ -43,14 +37,47 @@ class GzipVFSFile(apsw.VFSFile):
             data += b"\x00" * (amount - len(data))
         return data
 
-    def xFilesize(self):
+    def xFileSize(self):
         return self._size
 
     def xClose(self):
-        try:
-            os.unlink(self._tmpfile.name)
-        except OSError:
-            pass
+        pass
+
+    def xLock(self, level):
+        self._level = level
+
+    def xUnlock(self, level):
+        self._level = level
+
+    def xCheckReservedLock(self):
+        return False
+
+    def xSync(self, flags):
+        return True
+
+    def xSectorSize(self):
+        return 4096
+
+    def xDeviceCharacteristics(self):
+        return apsw.SQLITE_IOCAP_IMMUTABLE
+
+    def xTruncate(self, newsize):
+        pass
+
+    def xWrite(self, data, offset):
+        pass
+
+    def xFileControl(self, op, ptr):
+        return False
+
+    def xShmMap(self, *a):
+        raise apsw.IOError("Shared memory not supported")
+
+    def xShmBarrier(self):
+        pass
+
+    def xShmUnmap(self):
+        pass
 
 
 class GzipVFS(apsw.VFS):
@@ -63,7 +90,7 @@ class GzipVFS(apsw.VFS):
         super().__init__(name, base="")
 
     def xOpen(self, name, flags):
-        return GzipVFSFile(self.vfs_name, name, flags, self._gz, self._size)
+        return GzipVFSFile(self._gz, self._size)
 
     def xDelete(self, name, syncdir):
         pass
@@ -96,7 +123,6 @@ def main():
     t0 = time.time()
     gz = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
 
-    # Read SQLite header (first 100 bytes) to get page_size and page_count
     header = gz.read(100)
     if header[:16] != b"SQLite format 3\x00":
         print(f"ERROR: Not a SQLite database. Header: {header[:16]}", flush=True)
@@ -117,14 +143,17 @@ def main():
 
     gz.seek(0)
 
-    # Register custom VFS and connect
     vfs = GzipVFS(gz, db_size)
-    conn = apsw.Connection("file:dummy?immutable=1", vfs=vfs.vfs_name, flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI)
+    conn = apsw.Connection(
+        "file:dummy?immutable=1",
+        vfs=vfs.vfs_name,
+        flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI,
+    )
     cur = conn.cursor()
 
     report = {}
 
-    # --- 1. Schema (reads page 1 only — instant) ---
+    # --- 1. Schema ---
     print("\n=== TABLES ===", flush=True)
     tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     print(json.dumps(tables), flush=True)
@@ -149,7 +178,7 @@ def main():
     print(json.dumps(indexes), flush=True)
     report["indexes"] = indexes
 
-    # --- 2. Sample records (LIMIT 5 — reads a few pages) ---
+    # --- 2. Sample records ---
     print("\n=== SAMPLE RECORDS ===", flush=True)
     samples = []
     for row in cur.execute(
@@ -181,7 +210,7 @@ def main():
     except Exception as e:
         print(f"Error: {e}", flush=True)
 
-    # --- 3. Full table scan: tracks (sequential B-tree leaf page read) ---
+    # --- 3. Full scan: tracks ---
     print("\n=== FULL SCAN: TRACKS ===", flush=True)
     t0 = time.time()
 
@@ -233,7 +262,7 @@ def main():
     report["duration_avg"] = sum_duration / count_duration if count_duration else 0
     report["tracks_scan_time_s"] = tracks_time
 
-    # --- 4. Full table scan: lyrics (sequential B-tree leaf page read) ---
+    # --- 4. Full scan: lyrics ---
     print("\n=== FULL SCAN: LYRICS ===", flush=True)
     t1 = time.time()
 
