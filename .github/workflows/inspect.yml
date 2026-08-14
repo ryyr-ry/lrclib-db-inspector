@@ -12,7 +12,7 @@ env:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -27,20 +27,13 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Install FUSE
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse libfuse2
-          ls -la /dev/fuse || echo "WARNING: /dev/fuse not found"
-          sudo modprobe fuse 2>/dev/null || true
-          ls -la /dev/fuse || echo "WARNING: /dev/fuse still not found after modprobe"
-
-      - name: Install ratarmount
-        run: |
-          python3 -m pip install --user --break-system-packages ratarmount
+          sudo apt-get install -y aria2 python3-pip
+          pip install --user --break-system-packages rapidgzip apsw
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          which ratarmount
-          ratarmount --version
+          python3 -c "import rapidgzip; import apsw; print('rapidgzip + apsw OK')"
 
       - name: Download DB dump
         run: |
@@ -49,30 +42,11 @@ jobs:
             "https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz"
           echo "=== DOWNLOADED ==="
           ls -lh lrclib.sqlite3.gz
-          stat -c %s lrclib.sqlite3.gz
           df -h /
 
-      - name: Mount gzip via ratarmount
-        env:
-          MOUNT_DIR: ${{ github.workspace }}/mnt/sqlite
+      - name: Inspect DB via RapidgzipFile + APSW VFS
         run: |
-          echo "=== MOUNTING ==="
-          mkdir -p "$MOUNT_DIR"
-          ulimit -s unlimited 2>/dev/null || true
-          ulimit -n 65536 2>/dev/null || true
-          START=$(date +%s)
-          ratarmount -P 0 -gs 4194304 lrclib.sqlite3.gz "$MOUNT_DIR" 2>&1
-          END=$(date +%s)
-          echo "Mount time: $((END - START))s"
-          echo "=== MOUNTED ==="
-          ls -la "$MOUNT_DIR"/
-          df -h /
-
-      - name: Inspect DB (single Python script, one connection)
-        env:
-          DB_URI: file:${{ github.workspace }}/mnt/sqlite/lrclib.sqlite3?immutable=1
-        run: |
-          python3 scripts/inspect_db.py "$DB_URI"
+          python3 scripts/inspect_export.py lrclib.sqlite3.gz
 
       - name: Upload inspection report
         uses: actions/upload-artifact@v4
@@ -83,10 +57,8 @@ jobs:
       - name: Final disk space
         run: df -h /
 
-      - name: Unmount and cleanup
+      - name: Cleanup
         if: always()
         run: |
-          fusermount -u ${{ github.workspace }}/mnt/sqlite 2>/dev/null || true
           rm -f lrclib.sqlite3.gz
-          rm -f .*.index.sqlite
           df -h /
