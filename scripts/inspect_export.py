@@ -80,7 +80,7 @@ class GzipVFS(apsw.VFS):
     def __init__(self, gz_file, db_size, name="gzipvfs"):
         self._gz = gz_file
         self._size = db_size
-        super().__init__(name, basevfs="")
+        super().__init__(name, base="")
 
     def xOpen(self, name, flags):
         return GzipVFSFile(self._gz, self._size)
