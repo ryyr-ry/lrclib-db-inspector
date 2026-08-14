@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import struct
+import tempfile
 import apsw
 from rapidgzip import RapidgzipFile
 
@@ -19,18 +20,23 @@ GZIP_PATH = sys.argv[1]
 class GzipVFSFile(apsw.VFSFile):
     """VFS file handle backed by a shared RapidgzipFile.
 
-    Since we don't inherit from any real filesystem, we pass base=""
-    to VFSFile but never call super().__init__ which would try to open
-    a real file. Instead we override all needed methods directly.
+    We create a real temp file so APSW's VFSFile.__init__ succeeds
+    (opening it via the default VFS), then override xRead and xFilesize
+    to serve data from RapidgzipFile instead.
     """
 
-    def __init__(self, gz_file, db_size):
-        # Don't call super().__init__ — that triggers xOpen recursion.
-        # We set attributes manually and override all VFSFile methods.
+    def __init__(self, vfs_name, filename, flags, gz_file, db_size):
+        # Create a temp file and let the default VFS open it
+        self._tmpfile = tempfile.NamedTemporaryFile(
+            prefix="gzipvfs_", suffix=".sqlite", delete=False
+        )
+        self._tmpfile.write(b"\x00" * min(db_size, 4096))
+        self._tmpfile.close()
+        super().__init__("", self._tmpfile.name, flags)
         self._gz = gz_file
         self._size = db_size
 
-    def xRead(self, offset, amount):
+    def xRead(self, amount, offset):
         self._gz.seek(offset)
         data = self._gz.read(amount)
         if len(data) < amount:
@@ -41,43 +47,10 @@ class GzipVFSFile(apsw.VFSFile):
         return self._size
 
     def xClose(self):
-        pass
-
-    def xDeviceCharacteristics(self):
-        return apsw.SQLITE_IOCAP_IMMUTABLE
-
-    def xSectorSize(self):
-        return 4096
-
-    def xLock(self, level):
-        pass
-
-    def xUnlock(self, level):
-        pass
-
-    def xCheckReservedLock(self):
-        return False
-
-    def xSync(self, flags):
-        return True
-
-    def xTruncate(self, size):
-        pass
-
-    def xWrite(self, offset, data):
-        pass
-
-    def xFileControl(self, op, arg):
-        return False
-
-    def xShmMap(self, *a):
-        raise apsw.IOError("Shared memory not supported")
-
-    def xShmBarrier(self):
-        pass
-
-    def xShmUnmap(self):
-        pass
+        try:
+            os.unlink(self._tmpfile.name)
+        except OSError:
+            pass
 
 
 class GzipVFS(apsw.VFS):
@@ -90,7 +63,7 @@ class GzipVFS(apsw.VFS):
         super().__init__(name, base="")
 
     def xOpen(self, name, flags):
-        return GzipVFSFile(self._gz, self._size)
+        return GzipVFSFile(self.vfs_name, name, flags, self._gz, self._size)
 
     def xDelete(self, name, syncdir):
         pass
@@ -108,13 +81,13 @@ class GzipVFS(apsw.VFS):
     def xCurrentTime(self):
         return time.time() / 86400.0 + 2440587.5
 
-    def xGetSystemError(self, e):
-        return (e, "")
+    def xGetLastError(self):
+        return (0, "")
 
     def xDlError(self):
         return ""
 
-    def xRandom(self, n):
+    def xRandomness(self, n):
         return os.urandom(n)
 
 
