@@ -119,7 +119,7 @@ def main():
 
     # Register custom VFS and connect
     vfs = GzipVFS(gz, db_size)
-    conn = apsw.Connection("dummy", vfs=vfs.vfs_name, flags=apsw.SQLITE_OPEN_READONLY)
+    conn = apsw.Connection("file:dummy?immutable=1", vfs=vfs.vfs_name, flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI)
     cur = conn.cursor()
 
     report = {}
