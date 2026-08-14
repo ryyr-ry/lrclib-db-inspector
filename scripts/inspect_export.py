@@ -17,10 +17,16 @@ GZIP_PATH = sys.argv[1]
 
 
 class GzipVFSFile(apsw.VFSFile):
-    """VFS file handle backed by a shared RapidgzipFile."""
+    """VFS file handle backed by a shared RapidgzipFile.
 
-    def __init__(self, vfs_name, filename, flags, gz_file, db_size):
-        super().__init__(vfs_name, filename, flags)
+    Since we don't inherit from any real filesystem, we pass base=""
+    to VFSFile but never call super().__init__ which would try to open
+    a real file. Instead we override all needed methods directly.
+    """
+
+    def __init__(self, gz_file, db_size):
+        # Don't call super().__init__ — that triggers xOpen recursion.
+        # We set attributes manually and override all VFSFile methods.
         self._gz = gz_file
         self._size = db_size
 
@@ -84,7 +90,7 @@ class GzipVFS(apsw.VFS):
         super().__init__(name, base="")
 
     def xOpen(self, name, flags):
-        return GzipVFSFile(self.vfs_name, name, flags, self._gz, self._size)
+        return GzipVFSFile(self._gz, self._size)
 
     def xDelete(self, name, syncdir):
         pass
