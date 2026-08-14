@@ -80,6 +80,7 @@ class GzipVFS(apsw.VFS):
     def __init__(self, gz_file, db_size, name="gzipvfs"):
         self._gz = gz_file
         self._size = db_size
+        self.vfs_name = name
         super().__init__(name, base="")
 
     def xOpen(self, name, flags):
@@ -139,7 +140,7 @@ def main():
 
     # Register custom VFS and connect
     vfs = GzipVFS(gz, db_size)
-    conn = apsw.Connection("dummy", vfs=vfs.name, flags=apsw.SQLITE_OPEN_READONLY)
+    conn = apsw.Connection("dummy", vfs=vfs.vfs_name, flags=apsw.SQLITE_OPEN_READONLY)
     cur = conn.cursor()
 
     report = {}
