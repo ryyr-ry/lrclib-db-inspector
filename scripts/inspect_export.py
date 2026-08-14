@@ -19,8 +19,8 @@ GZIP_PATH = sys.argv[1]
 class GzipVFSFile(apsw.VFSFile):
     """VFS file handle backed by a shared RapidgzipFile."""
 
-    def __init__(self, gz_file, db_size):
-        super().__init__("")
+    def __init__(self, vfs_name, filename, flags, gz_file, db_size):
+        super().__init__(vfs_name, filename, flags)
         self._gz = gz_file
         self._size = db_size
 
@@ -84,7 +84,7 @@ class GzipVFS(apsw.VFS):
         super().__init__(name, base="")
 
     def xOpen(self, name, flags):
-        return GzipVFSFile(self._gz, self._size)
+        return GzipVFSFile(self.vfs_name, name, flags, self._gz, self._size)
 
     def xDelete(self, name, syncdir):
         pass
